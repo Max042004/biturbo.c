@@ -56,12 +56,38 @@ typedef struct {
  * Per-tensor float32 scale appended after packed bytes.
  * ============================================================ */
 
+typedef struct bt_tmac_weight bt_tmac_weight_t;
+
 typedef struct {
     const uint8_t* data;    /* pointer into mmap'd packed I2_S data       */
     float          scale;   /* per-tensor scale (from end of I2_S blob)   */
     int            rows;    /* ne1: output features (number of rows)      */
     int            cols;    /* ne0: input features (elements per row)     */
+    bt_tmac_weight_t* tmac; /* T-MAC repacked weight (NULL if not repacked) */
 } bt_i2s_weight_t;
+
+/* ============================================================
+ * T-MAC TL2 repacked weight
+ *
+ * Packs 3 ternary weights into 4-bit LUT index + 1-bit sign.
+ * 3^3=27 combos, sign-paired → 14 unsigned classes in 4-bit nibble.
+ * Remainder columns (K%3) use 2-weight groups (3^2=9, no sign).
+ * Row-major layout: nibbles packed 2/byte, signs packed 8/byte.
+ * ============================================================ */
+
+struct bt_tmac_weight {
+    uint8_t* three_nib;     /* packed 4-bit indices for 3-weight groups   */
+    uint8_t* three_sign;    /* packed sign bits for 3-weight groups       */
+    uint8_t* two_nib;       /* packed 4-bit indices for 2-weight groups   */
+    float    scale;         /* per-tensor weight scale                    */
+    int      rows;          /* output features                            */
+    int      cols;          /* input features                             */
+    int      n3;            /* number of 3-weight groups (cols / 3)       */
+    int      n2;            /* number of 2-weight groups (0 or 1)         */
+    int      nib3_stride;   /* bytes per row for three_nib                */
+    int      sign_stride;   /* bytes per row for three_sign               */
+    int      nib2_stride;   /* bytes per row for two_nib                  */
+};
 
 /* ============================================================
  * TurboQuant KV cache block (4-bit: 3-bit codebook + 1-bit QJL)
@@ -150,6 +176,7 @@ typedef struct {
     float* v;           /* value [kv_dim]                            */
     float* att;         /* attention scores [n_heads, max_seq_len]   */
     int8_t* q8_buf;     /* quantized activations scratch             */
+    int16_t* lut_buf;   /* T-MAC LUT scratch [max_k/3 * 16]         */
     float* q_rht;       /* RHT-rotated query scratch [head_dim]      */
     float* q_qjl;       /* QJL query projection scratch [head_dim]   */
     float* logits;      /* output logits [vocab_size]                */

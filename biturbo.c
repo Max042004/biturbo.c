@@ -295,11 +295,238 @@ static void i2s_gemv(float* out, const bt_i2s_weight_t* w,
     }
 }
 
-/* BitLinear forward: quantize input → I2_S GEMV → output */
-static void bitlinear_forward(float* out, const float* x, int8_t* q8_buf,
-                              const bt_i2s_weight_t* w) {
+/* ================================================================
+ * §4b. T-MAC TL2 LOOKUP TABLE GEMV
+ *
+ * Packs 3 ternary weights → 4-bit LUT index + 1-bit sign.
+ * LUT has 16 int16 entries (14 used) precomputed from each
+ * activation triple. GEMV becomes table lookup + accumulate.
+ *
+ * Encoding: canonical form has first nonzero weight = +1.
+ *   If first nonzero is -1, negate all three weights, sign = 1.
+ *   nibble indexes the unsigned pattern, sign negates the result.
+ * ================================================================ */
+
+/*
+ * Three-weight encoding table: TMAC3_ENC[w0+1][w1+1][w2+1]
+ * Value = (nibble_index << 1) | sign_bit
+ *
+ * LUT index → unsigned coefficient pattern (c0, c1, c2):
+ *  0: (0,0,0)      1: (0,0,+1)    2: (0,+1,0)     3: (+1,0,0)
+ *  4: (0,+1,+1)    5: (+1,0,+1)   6: (+1,+1,0)    7: (0,+1,-1)
+ *  8: (+1,0,-1)    9: (+1,-1,0)  10: (+1,+1,+1)  11: (+1,+1,-1)
+ * 12: (+1,-1,+1)  13: (+1,-1,-1)  14: unused       15: unused
+ */
+static const uint8_t TMAC3_ENC[3][3][3] = {
+    /* w0 = -1 (index 0) */
+    {   /* w1 = -1 */
+        { (10<<1)|1, ( 6<<1)|1, (11<<1)|1 },   /* w2 = -1, 0, +1 */
+        /* w1 = 0 */
+        { ( 5<<1)|1, ( 3<<1)|1, ( 8<<1)|1 },
+        /* w1 = +1 */
+        { (12<<1)|1, ( 9<<1)|1, (13<<1)|1 }
+    },
+    /* w0 = 0 (index 1) */
+    {   /* w1 = -1 */
+        { ( 4<<1)|1, ( 2<<1)|1, ( 7<<1)|1 },
+        /* w1 = 0 */
+        { ( 1<<1)|1, ( 0<<1)|0, ( 1<<1)|0 },
+        /* w1 = +1 */
+        { ( 7<<1)|0, ( 2<<1)|0, ( 4<<1)|0 }
+    },
+    /* w0 = +1 (index 2) */
+    {   /* w1 = -1 */
+        { (13<<1)|0, ( 9<<1)|0, (12<<1)|0 },
+        /* w1 = 0 */
+        { ( 8<<1)|0, ( 3<<1)|0, ( 5<<1)|0 },
+        /* w1 = +1 */
+        { (11<<1)|0, ( 6<<1)|0, (10<<1)|0 }
+    }
+};
+
+/* Two-weight encoding: TMAC2_ENC[w0+1][w1+1] = nibble index (no sign) */
+static const uint8_t TMAC2_ENC[3][3] = {
+    /* w0=-1 */ { 8, 6, 7 },   /* w1 = -1, 0, +1 */
+    /* w0= 0 */ { 2, 0, 1 },
+    /* w0=+1 */ { 5, 3, 4 }
+};
+
+/* Decode a single ternary value from I2_S weight at (row, col) */
+static inline int8_t i2s_decode(const bt_i2s_weight_t* w, int row, int col) {
+    int bytes_per_row = ((w->cols + 127) / 128) * 32;
+    int block = col / 128;
+    int group = (col % 128) / 32;
+    int pos   = col % 32;
+    uint8_t byte = w->data[(size_t)row * bytes_per_row + block * 32 + pos];
+    return I2S_MAP[(byte >> (6 - 2 * group)) & 3];
+}
+
+/* Repack I2_S weight into T-MAC TL2 format */
+static void tmac_repack(bt_i2s_weight_t* w) {
+    int rows = w->rows, cols = w->cols;
+    int n3 = cols / 3;
+    int n2 = (cols % 3 != 0) ? 1 : 0;
+
+    bt_tmac_weight_t* tw = (bt_tmac_weight_t*)bt_calloc(1, sizeof(*tw));
+    tw->rows = rows;
+    tw->cols = cols;
+    tw->scale = w->scale;
+    tw->n3 = n3;
+    tw->n2 = n2;
+    tw->nib3_stride = (n3 + 1) / 2;        /* ceil(n3/2) bytes per row */
+    tw->sign_stride = (n3 + 7) / 8;        /* ceil(n3/8) bytes per row */
+    tw->nib2_stride = (n2 + 1) / 2;        /* 0 or 1 */
+
+    tw->three_nib  = (uint8_t*)bt_calloc((size_t)rows * tw->nib3_stride, 1);
+    tw->three_sign = (uint8_t*)bt_calloc((size_t)rows * tw->sign_stride, 1);
+    if (n2 > 0)
+        tw->two_nib = (uint8_t*)bt_calloc((size_t)rows * tw->nib2_stride, 1);
+    else
+        tw->two_nib = NULL;
+
+    for (int r = 0; r < rows; r++) {
+        /* Three-weight groups */
+        for (int g = 0; g < n3; g++) {
+            int8_t t0 = i2s_decode(w, r, g * 3 + 0);
+            int8_t t1 = i2s_decode(w, r, g * 3 + 1);
+            int8_t t2 = i2s_decode(w, r, g * 3 + 2);
+
+            uint8_t enc = TMAC3_ENC[t0 + 1][t1 + 1][t2 + 1];
+            uint8_t nib  = enc >> 1;
+            uint8_t sign = enc & 1;
+
+            /* Pack nibble: even g → high nibble, odd g → low nibble */
+            size_t nib_idx = (size_t)r * tw->nib3_stride + g / 2;
+            if (g & 1)
+                tw->three_nib[nib_idx] |= nib;
+            else
+                tw->three_nib[nib_idx] |= (nib << 4);
+
+            /* Pack sign bit */
+            size_t sign_idx = (size_t)r * tw->sign_stride + g / 8;
+            tw->three_sign[sign_idx] |= (sign << (g & 7));
+        }
+
+        /* Two-weight groups (remainder) */
+        if (n2 > 0) {
+            int col_base = n3 * 3;
+            int8_t t0 = i2s_decode(w, r, col_base);
+            int8_t t1 = (col_base + 1 < cols) ? i2s_decode(w, r, col_base + 1) : 0;
+
+            uint8_t nib = TMAC2_ENC[t0 + 1][t1 + 1];
+            /* Single group → always high nibble of byte 0 */
+            tw->two_nib[(size_t)r * tw->nib2_stride] = (nib << 4);
+        }
+    }
+
+    w->tmac = tw;
+}
+
+/* Build three-weight LUT from quantized activations */
+static void tmac_build_three_lut(int16_t* lut, const int8_t* x_q, int n3) {
+    for (int g = 0; g < n3; g++) {
+        int16_t a0 = x_q[g * 3 + 0];
+        int16_t a1 = x_q[g * 3 + 1];
+        int16_t a2 = x_q[g * 3 + 2];
+        int16_t* t = lut + g * 16;
+        t[ 0] = 0;
+        t[ 1] = a2;
+        t[ 2] = a1;
+        t[ 3] = a0;
+        t[ 4] = a1 + a2;
+        t[ 5] = a0 + a2;
+        t[ 6] = a0 + a1;
+        t[ 7] = a1 - a2;
+        t[ 8] = a0 - a2;
+        t[ 9] = a0 - a1;
+        t[10] = a0 + a1 + a2;
+        t[11] = a0 + a1 - a2;
+        t[12] = a0 - a1 + a2;
+        t[13] = a0 - a1 - a2;
+        t[14] = 0;
+        t[15] = 0;
+    }
+}
+
+/* Build two-weight LUT from quantized activations */
+static void tmac_build_two_lut(int16_t* lut, const int8_t* x_q,
+                               int col_base, int cols, int n2) {
+    for (int g = 0; g < n2; g++) {
+        int16_t a0 = x_q[col_base + g * 2 + 0];
+        int16_t a1 = (col_base + g * 2 + 1 < cols) ? x_q[col_base + g * 2 + 1] : 0;
+        int16_t* t = lut + g * 16;
+        t[0] =  0;       t[1] =  a1;      t[2] = -a1;
+        t[3] =  a0;      t[4] =  a0 + a1; t[5] =  a0 - a1;
+        t[6] = -a0;      t[7] = -a0 + a1; t[8] = -a0 - a1;
+        t[9] = 0; t[10] = 0; t[11] = 0;
+        t[12] = 0; t[13] = 0; t[14] = 0; t[15] = 0;
+    }
+}
+
+/* T-MAC TL2 GEMV kernel */
+static void tmac_gemv(float* out, const bt_tmac_weight_t* tw,
+                      float inv_scale,
+                      const int16_t* three_lut, const int16_t* two_lut) {
+    int rows = tw->rows;
+    int n3 = tw->n3;
+    int n2 = tw->n2;
+    float dequant = inv_scale * tw->scale;
+
+    for (int r = 0; r < rows; r++) {
+        int32_t acc = 0;
+
+        /* Three-weight groups */
+        const uint8_t* nib_row  = tw->three_nib  + (size_t)r * tw->nib3_stride;
+        const uint8_t* sign_row = tw->three_sign + (size_t)r * tw->sign_stride;
+
+        for (int g = 0; g < n3; g++) {
+            /* Extract 4-bit nibble */
+            uint8_t packed = nib_row[g / 2];
+            int nibble = (g & 1) ? (packed & 0x0F) : (packed >> 4);
+
+            /* Extract sign bit */
+            int sign_bit = (sign_row[g / 8] >> (g & 7)) & 1;
+
+            /* Lookup and accumulate */
+            int16_t val = three_lut[g * 16 + nibble];
+            acc += sign_bit ? -(int32_t)val : (int32_t)val;
+        }
+
+        /* Two-weight groups */
+        if (n2 > 0) {
+            const uint8_t* nib2_row = tw->two_nib + (size_t)r * tw->nib2_stride;
+            for (int g = 0; g < n2; g++) {
+                uint8_t packed = nib2_row[g / 2];
+                int nibble = (g & 1) ? (packed & 0x0F) : (packed >> 4);
+                acc += (int32_t)two_lut[g * 16 + nibble];
+            }
+        }
+
+        out[r] = (float)acc * dequant;
+    }
+}
+
+/* T-MAC BitLinear forward: quantize → build LUTs → T-MAC GEMV */
+static void tmac_forward(float* out, const float* x, int8_t* q8_buf,
+                         int16_t* lut_buf, const bt_i2s_weight_t* w) {
+    bt_tmac_weight_t* tw = w->tmac;
     float inv_scale = bitlinear_quantize(q8_buf, x, w->cols);
-    i2s_gemv(out, w, q8_buf, inv_scale);
+    tmac_build_three_lut(lut_buf, q8_buf, tw->n3);
+    int16_t* two_lut = lut_buf + tw->n3 * 16;
+    tmac_build_two_lut(two_lut, q8_buf, tw->n3 * 3, tw->cols, tw->n2);
+    tmac_gemv(out, tw, inv_scale, lut_buf, two_lut);
+}
+
+/* Free T-MAC repacked weight */
+static void tmac_free(bt_i2s_weight_t* w) {
+    if (w->tmac) {
+        bt_tmac_weight_t* tw = w->tmac;
+        free(tw->three_nib);
+        free(tw->three_sign);
+        free(tw->two_nib);
+        free(tw);
+        w->tmac = NULL;
+    }
 }
 
 /* ================================================================
@@ -597,11 +824,17 @@ void bt_forward(bt_model_t* model, int token, int pos) {
         /* Stage 3: Pre-attention RMS norm */
         rms_norm(s->xb, s->x, lw->attn_norm, dim, cfg->norm_eps);
 
-        /* Stage 4-6-7: Q/K/V projections (BitLinear) */
+        /* Stage 4-6-7: Q/K/V projections (BitLinear + T-MAC) */
         float inv_scale = bitlinear_quantize(s->q8_buf, s->xb, dim);
-        i2s_gemv(s->q, &lw->wq, s->q8_buf, inv_scale);
-        i2s_gemv(s->k, &lw->wk, s->q8_buf, inv_scale);
-        i2s_gemv(s->v, &lw->wv, s->q8_buf, inv_scale);
+        {
+            bt_tmac_weight_t* tw = lw->wq.tmac;
+            tmac_build_three_lut(s->lut_buf, s->q8_buf, tw->n3);
+            int16_t* two_lut = s->lut_buf + tw->n3 * 16;
+            tmac_build_two_lut(two_lut, s->q8_buf, tw->n3 * 3, tw->cols, tw->n2);
+            tmac_gemv(s->q, tw, inv_scale, s->lut_buf, two_lut);
+            tmac_gemv(s->k, lw->wk.tmac, inv_scale, s->lut_buf, two_lut);
+            tmac_gemv(s->v, lw->wv.tmac, inv_scale, s->lut_buf, two_lut);
+        }
 
         /* Stage 8: RoPE on Q and K */
         rope(s->q, head_dim, n_heads, pos, cfg->rope_theta);
@@ -653,7 +886,7 @@ void bt_forward(bt_model_t* model, int token, int pos) {
 
         /* Stage 11: Attention sub-norm + output projection */
         rms_norm(s->xb, s->xb2, lw->attn_sub_norm, dim, cfg->norm_eps);
-        bitlinear_forward(s->xb2, s->xb, s->q8_buf, &lw->wo);
+        tmac_forward(s->xb2, s->xb, s->q8_buf, s->lut_buf, &lw->wo);
 
         /* Residual */
         for (int i = 0; i < dim; i++) s->x[i] += s->xb2[i];
@@ -661,8 +894,14 @@ void bt_forward(bt_model_t* model, int token, int pos) {
         /* Stage 12: FFN pre-norm + gate/up projections */
         rms_norm(s->xb, s->x, lw->ffn_norm, dim, cfg->norm_eps);
         inv_scale = bitlinear_quantize(s->q8_buf, s->xb, dim);
-        i2s_gemv(s->hb, &lw->w_gate, s->q8_buf, inv_scale);
-        i2s_gemv(s->hb2, &lw->w_up, s->q8_buf, inv_scale);
+        {
+            bt_tmac_weight_t* tw = lw->w_gate.tmac;
+            tmac_build_three_lut(s->lut_buf, s->q8_buf, tw->n3);
+            int16_t* two_lut = s->lut_buf + tw->n3 * 16;
+            tmac_build_two_lut(two_lut, s->q8_buf, tw->n3 * 3, tw->cols, tw->n2);
+            tmac_gemv(s->hb, tw, inv_scale, s->lut_buf, two_lut);
+            tmac_gemv(s->hb2, lw->w_up.tmac, inv_scale, s->lut_buf, two_lut);
+        }
 
         /* SqReLU gating: hidden = SqReLU(gate) * up */
         for (int i = 0; i < ffn_dim; i++) {
@@ -673,7 +912,7 @@ void bt_forward(bt_model_t* model, int token, int pos) {
 
         /* Stage 13: FFN sub-norm + down projection */
         rms_norm(s->hb2, s->hb, lw->ffn_sub_norm, ffn_dim, cfg->norm_eps);
-        bitlinear_forward(s->xb, s->hb2, s->q8_buf, &lw->w_down);
+        tmac_forward(s->xb, s->hb2, s->q8_buf, s->lut_buf, &lw->w_down);
 
         /* Residual */
         for (int i = 0; i < dim; i++) s->x[i] += s->xb[i];
@@ -969,6 +1208,7 @@ static void init_i2s_weight(bt_i2s_weight_t* w, const gguf_tensor_info_t* ti,
     w->data = blob;
     /* Scale is the last 4 bytes of the I2_S blob */
     memcpy(&w->scale, blob + packed_bytes, sizeof(float));
+    w->tmac = NULL;
 }
 
 static float* load_f32_tensor(const gguf_tensor_info_t* ti,
@@ -999,6 +1239,9 @@ static int alloc_state(bt_state_t* s, const bt_config_t* cfg) {
     s->att    = (float*)bt_calloc((size_t)cfg->n_heads * cfg->max_seq_len,
                                   sizeof(float));
     s->q8_buf = (int8_t*)bt_calloc(max_buf, sizeof(int8_t));
+    /* T-MAC LUT: max_k/3 three-groups * 16 entries + 16 for two-group */
+    int max_k = dim > ffn_dim ? dim : ffn_dim;
+    s->lut_buf = (int16_t*)bt_calloc((size_t)(max_k / 3 + 1) * 16, sizeof(int16_t));
     int head_dim = BT_HEAD_DIM(cfg);
     s->q_rht  = (float*)bt_calloc(head_dim, sizeof(float));
     s->q_qjl  = (float*)bt_calloc(head_dim, sizeof(float));
@@ -1275,6 +1518,21 @@ int bt_load_model(bt_model_t* model, const char* path) {
     }
 
     free(tensors);
+
+    /* Repack all I2_S weights into T-MAC TL2 format */
+    for (int l = 0; l < cfg->n_layers; l++) {
+        bt_layer_weights_t* lw = &wt->layers[l];
+        tmac_repack(&lw->wq);
+        tmac_repack(&lw->wk);
+        tmac_repack(&lw->wv);
+        tmac_repack(&lw->wo);
+        tmac_repack(&lw->w_gate);
+        tmac_repack(&lw->w_up);
+        tmac_repack(&lw->w_down);
+    }
+    fprintf(stderr, "biturbo: T-MAC TL2 weights repacked (%d layers)\n",
+            cfg->n_layers);
+
     fprintf(stderr, "biturbo: model loaded (%.1f MB mmap'd)\n",
             (double)model->mmap_size / (1024 * 1024));
     return 0;
@@ -1290,10 +1548,18 @@ void bt_free_model(bt_model_t* model) {
     bt_weights_t* wt = &model->weights;
     if (wt->layers) {
         for (int l = 0; l < model->config.n_layers; l++) {
-            free(wt->layers[l].attn_norm);
-            free(wt->layers[l].attn_sub_norm);
-            free(wt->layers[l].ffn_norm);
-            free(wt->layers[l].ffn_sub_norm);
+            bt_layer_weights_t* lw = &wt->layers[l];
+            free(lw->attn_norm);
+            free(lw->attn_sub_norm);
+            free(lw->ffn_norm);
+            free(lw->ffn_sub_norm);
+            tmac_free(&lw->wq);
+            tmac_free(&lw->wk);
+            tmac_free(&lw->wv);
+            tmac_free(&lw->wo);
+            tmac_free(&lw->w_gate);
+            tmac_free(&lw->w_up);
+            tmac_free(&lw->w_down);
         }
         free(wt->layers);
     }
@@ -1304,7 +1570,8 @@ void bt_free_model(bt_model_t* model) {
     free(s->x); free(s->xb); free(s->xb2);
     free(s->hb); free(s->hb2);
     free(s->q); free(s->k); free(s->v);
-    free(s->att); free(s->q8_buf); free(s->q_rht); free(s->q_qjl); free(s->logits);
+    free(s->att); free(s->q8_buf); free(s->lut_buf);
+    free(s->q_rht); free(s->q_qjl); free(s->logits);
     if (s->kv) {
         for (int l = 0; l < model->config.n_layers; l++) {
             free(s->kv[l].k_cache);
