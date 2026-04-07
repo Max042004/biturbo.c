@@ -39,6 +39,7 @@
 #define BT_REG_DIM_K          0x10
 #define BT_REG_SIGN_BASE      0x14
 #define BT_REG_PERF_CYCLES    0x18
+#define BT_REG_DIM_N3         0x1C  /* HPS-supplied K/3 to avoid on-chip divider */
 #define BT_REG_ACT_DDR3_BASE  0x28
 #define BT_REG_RES_DDR3_BASE  0x2C
 
@@ -411,6 +412,7 @@ static void bt_fpga_gemv(const bt_tmac_weight_t *tw,
         bt_fpga_reg_write(BT_REG_SIGN_BASE, tile_sign);
         bt_fpga_reg_write(BT_REG_DIM_M, (uint32_t)tile_m);
         bt_fpga_reg_write(BT_REG_DIM_K, (uint32_t)K);
+        bt_fpga_reg_write(BT_REG_DIM_N3, (uint32_t)(K / 3));
         bt_fpga_reg_write(BT_REG_ACT_DDR3_BASE, act_phys);
         bt_fpga_reg_write(BT_REG_RES_DDR3_BASE, res_phys);
         bt_fpga_reg_write(BT_REG_CTRL, BT_CTRL_START | BT_CTRL_DDR3_MODE);
