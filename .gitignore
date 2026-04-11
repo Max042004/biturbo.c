@@ -1,0 +1,29 @@
+# --- Compiled Binaries & Objects ---
+biturbo
+main.o
+biturbo.o
+
+# General patterns for C development
+*.o
+*.obj
+*.out
+*.exe
+
+# --- Python / Environment ---
+.venv/
+__pycache__/
+*.py[cod]
+
+# --- Model Data ---
+model/
+*.bin
+*.gguf
+
+# --- OS / Editor Specific ---
+.DS_Store
+.vscode/
+.idea/
+*.swp
+
+# --- Build logs ---
+*.log
