@@ -96,40 +96,43 @@ static void bt_profile_print_layer_stage_summary(const double *totals,
 
     fprintf(stderr, "  layer stages (totals, ms/layer-token):\n");
     fprintf(stderr,
-            "    attn_norm=%7.2fs %8.3f | qkv=%7.2fs %8.3f | rope=%7.2fs %8.3f\n",
+            "    attn_norm=%7.2fs %8.3f | wt_load=%7.2fs %8.3f | qkv=%7.2fs %8.3f\n",
             totals[BT_PROFILE_LAYER_STAGE_ATTN_NORM],
             bt_profile_ms_per_layer_token(
                 totals[BT_PROFILE_LAYER_STAGE_ATTN_NORM], layer_tokens),
+            totals[BT_PROFILE_LAYER_STAGE_WEIGHT_LOAD],
+            bt_profile_ms_per_layer_token(
+                totals[BT_PROFILE_LAYER_STAGE_WEIGHT_LOAD], layer_tokens),
             totals[BT_PROFILE_LAYER_STAGE_QKV],
             bt_profile_ms_per_layer_token(
-                totals[BT_PROFILE_LAYER_STAGE_QKV], layer_tokens),
+                totals[BT_PROFILE_LAYER_STAGE_QKV], layer_tokens));
+    fprintf(stderr,
+            "    rope     =%7.2fs %8.3f | kv_cache=%7.2fs %8.3f | attention=%7.2fs %8.3f\n",
             totals[BT_PROFILE_LAYER_STAGE_ROPE],
             bt_profile_ms_per_layer_token(
-                totals[BT_PROFILE_LAYER_STAGE_ROPE], layer_tokens));
-    fprintf(stderr,
-            "    kv_cache =%7.2fs %8.3f | attention=%7.2fs %8.3f | attn_out=%7.2fs %8.3f\n",
+                totals[BT_PROFILE_LAYER_STAGE_ROPE], layer_tokens),
             totals[BT_PROFILE_LAYER_STAGE_KV_CACHE],
             bt_profile_ms_per_layer_token(
                 totals[BT_PROFILE_LAYER_STAGE_KV_CACHE], layer_tokens),
             totals[BT_PROFILE_LAYER_STAGE_ATTENTION],
             bt_profile_ms_per_layer_token(
-                totals[BT_PROFILE_LAYER_STAGE_ATTENTION], layer_tokens),
+                totals[BT_PROFILE_LAYER_STAGE_ATTENTION], layer_tokens));
+    fprintf(stderr,
+            "    attn_out =%7.2fs %8.3f | attn_res=%7.2fs %8.3f | ffn_in=%7.2fs %8.3f\n",
             totals[BT_PROFILE_LAYER_STAGE_ATTN_OUT],
             bt_profile_ms_per_layer_token(
-                totals[BT_PROFILE_LAYER_STAGE_ATTN_OUT], layer_tokens));
-    fprintf(stderr,
-            "    attn_res =%7.2fs %8.3f | ffn_in=%7.2fs %8.3f | sqrelu=%7.2fs %8.3f\n",
+                totals[BT_PROFILE_LAYER_STAGE_ATTN_OUT], layer_tokens),
             totals[BT_PROFILE_LAYER_STAGE_ATTN_RESIDUAL],
             bt_profile_ms_per_layer_token(
                 totals[BT_PROFILE_LAYER_STAGE_ATTN_RESIDUAL], layer_tokens),
             totals[BT_PROFILE_LAYER_STAGE_FFN_IN],
             bt_profile_ms_per_layer_token(
-                totals[BT_PROFILE_LAYER_STAGE_FFN_IN], layer_tokens),
+                totals[BT_PROFILE_LAYER_STAGE_FFN_IN], layer_tokens));
+    fprintf(stderr,
+            "    sqrelu   =%7.2fs %8.3f | ffn_out=%7.2fs %8.3f | ffn_res=%7.2fs %8.3f\n",
             totals[BT_PROFILE_LAYER_STAGE_SQRELU],
             bt_profile_ms_per_layer_token(
-                totals[BT_PROFILE_LAYER_STAGE_SQRELU], layer_tokens));
-    fprintf(stderr,
-            "    ffn_out  =%7.2fs %8.3f | ffn_res=%7.2fs %8.3f\n",
+                totals[BT_PROFILE_LAYER_STAGE_SQRELU], layer_tokens),
             totals[BT_PROFILE_LAYER_STAGE_FFN_OUT],
             bt_profile_ms_per_layer_token(
                 totals[BT_PROFILE_LAYER_STAGE_FFN_OUT], layer_tokens),
@@ -1185,6 +1188,16 @@ void bt_forward(bt_model_t* model, int token, int pos) {
             &s->profile_last_layer_stage_sec[BT_PROFILE_LAYER_STAGE_ATTN_NORM],
             ts_stage_start);
 
+#ifdef BT_FPGA
+        if (bt_fpga_regs) {
+            clock_gettime(CLOCK_MONOTONIC, &ts_stage_start);
+            bt_fpga_load_layer(model, l);
+            bt_profile_accum_elapsed(
+                &s->profile_last_layer_stage_sec[BT_PROFILE_LAYER_STAGE_WEIGHT_LOAD],
+                ts_stage_start);
+        }
+#endif
+
         /* Stage 4-6-7: Q/K/V projections (BitLinear + T-MAC) */
         clock_gettime(CLOCK_MONOTONIC, &ts_stage_start);
         clock_gettime(CLOCK_MONOTONIC, &ts_sub_start);
@@ -1194,12 +1207,6 @@ void bt_forward(bt_model_t* model, int token, int pos) {
             ts_sub_start);
 #ifdef BT_FPGA
         if (bt_fpga_regs) {
-            clock_gettime(CLOCK_MONOTONIC, &ts_sub_start);
-            bt_fpga_load_layer(model, l);
-            bt_profile_accum_elapsed(
-                &s->profile_last_qkv_stage_sec[BT_PROFILE_QKV_STAGE_PREP],
-                ts_sub_start);
-
             clock_gettime(CLOCK_MONOTONIC, &ts_sub_start);
             bt_fpga_upload_activations(s->q8_buf, dim);
             bt_profile_accum_elapsed(
@@ -2641,6 +2648,18 @@ void bt_generate(bt_model_t* model, bt_sampler_t* sampler,
         fprintf(stderr, "biturbo: %d tokens in %.2fs (%.1f tok/s)\n",
                 gen_count, elapsed, (double)gen_count / elapsed);
         fprintf(stderr, "biturbo: profile\n");
+#ifdef BT_FPGA
+        if (bt_fpga_regs) {
+            fprintf(stderr,
+                    "  runtime: build=fpga | backend=%s | persistent_weights=%s\n",
+                    bt_fpga_backend_name(bt_fpga_mem_backend),
+                    bt_fpga_mem_backend == BT_FPGA_MEM_CMA ? "yes" : "no");
+        } else {
+            fprintf(stderr, "  runtime: build=fpga | backend=cpu-fallback\n");
+        }
+#else
+        fprintf(stderr, "  runtime: build=cpu\n");
+#endif
         fprintf(stderr,
                 "  generated tokens: layers=%.2fs (%.2f s/token) | "
                 "lm_head=%.2fs (%.2f s/token) | sampling=%.2fs (%.4f s/token)\n",
