@@ -2193,7 +2193,11 @@ int bt_load_model(bt_model_t* model, const char* path) {
                     bt_free_model(model);
                     return -1;
                 }
-                fprintf(stderr, "biturbo: FPGA T-MAC ready (btpk fast path)\n");
+                fprintf(stderr,
+                        "biturbo: FPGA T-MAC ready (btpk fast path, backend=%s, layout=%s, persistent_weights=%s)\n",
+                        bt_fpga_backend_name(bt_fpga_mem_backend),
+                        bt_fpga_layout_name(bt_fpga_layout),
+                        bt_fpga_layout == BT_FPGA_LAYOUT_PERSISTENT ? "yes" : "no");
             } else {
                 fprintf(stderr,
                         "biturbo: FPGA init failed; .btpk requires FPGA fast path\n");
@@ -2472,7 +2476,11 @@ int bt_load_model(bt_model_t* model, const char* path) {
             ddr3_span = (uint32_t)strtoul(s, NULL, 0);
         if (bt_fpga_init(ddr3_base, ddr3_avm_base, ddr3_span) == 0) {
             if (bt_fpga_prepare_layout(model) == 0) {
-                fprintf(stderr, "biturbo: FPGA T-MAC accelerator ready\n");
+                fprintf(stderr,
+                        "biturbo: FPGA T-MAC accelerator ready (backend=%s, layout=%s, persistent_weights=%s)\n",
+                        bt_fpga_backend_name(bt_fpga_mem_backend),
+                        bt_fpga_layout_name(bt_fpga_layout),
+                        bt_fpga_layout == BT_FPGA_LAYOUT_PERSISTENT ? "yes" : "no");
             } else {
                 fprintf(stderr, "biturbo: FPGA layout init failed, using CPU path\n");
                 bt_fpga_cleanup();

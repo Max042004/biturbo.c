@@ -109,12 +109,14 @@ The CPU-only `./biturbo` executable expects GGUF and will reject `.btpk`.
 
 ## DE10-Nano FPGA path
 
-The FPGA build now supports two memory backends:
+The FPGA build now supports two memory backends and two DDR3 layout modes:
 
-- `devmem`: legacy fixed DDR carveout through `/dev/mem`
-- `cma`: Linux CMA-backed DMA allocation through `/dev/biturbo-cma`
+- backend `devmem`: reserved DDR carveout mapped through `/dev/mem`
+- backend `cma`: Linux CMA-backed DMA allocation through `/dev/biturbo-cma`
+- layout `streaming`: one small weight window reused on each layer switch
+- layout `persistent`: every weight gets a stable DDR address and is loaded once
 
-The CMA backend is the recommended path for persistent `.btpk` inference. Each weight blob is allocated as its own DMA buffer, copied into DDR once during model load, and then reused across tokens. This removes the old per-token layer streaming cost.
+Persistent inference is no longer tied to CMA. The `cma` backend is always persistent, and the `devmem` backend can also run persistent when the reserved DDR span is large enough for all weights plus activation/result scratch.
 
 ### FPGA userspace build
 
@@ -130,11 +132,17 @@ This builds `biturbo_fpga` for the Cortex-A9 on DE10-Nano with `BT_FPGA` enabled
 
 - `auto` or unset: try CMA first, then fall back to legacy `devmem`
 - `cma`: require `/dev/biturbo-cma`
-- `devmem`: force the old carveout backend
+- `devmem`: force the reserved-memory `/dev/mem` backend
 
-If the board has already been switched to a reusable CMA pool in the device tree, prefer `BT_FPGA_MEM_BACKEND=cma` so the process does not silently fall back to raw `/dev/mem` access against Linux-managed RAM.
+`biturbo_fpga` also checks `BT_FPGA_DDR_LAYOUT`:
 
-### CMA driver build
+- `auto` or unset: choose `persistent` when the mapped DDR span can hold the full model weights plus scratch, otherwise fall back to `streaming`
+- `persistent`: require enough reserved DDR for the whole weight set
+- `streaming`: force the old layer-window behavior even on a large carveout
+
+On a board with a dedicated reserved carveout, `BT_FPGA_MEM_BACKEND=devmem BT_FPGA_DDR_LAYOUT=persistent` avoids Linux CMA entirely while keeping weights resident across tokens.
+
+### Optional CMA driver build
 
 Build on target, or build against a matching DE10-Nano kernel tree:
 
@@ -155,7 +163,7 @@ The repository `Makefile` injects the ARMv7 module flags needed for older 4.14 A
 
 ### Device tree
 
-The matching CMA pool and platform device live in [`soc_system.dts`](../soc_system.dts). The default pool in this repo is sized for persistent BitNet weights:
+For the persistent `devmem` path, reserve a `no-map` carveout large enough for BitNet weights plus scratch buffers. The default region in this repo is:
 
 ```text
 base = 0x24000000
@@ -173,11 +181,14 @@ reserved-memory {
     biturbo_fpga_reserved: biturbo-fpga@24000000 {
         reg = <0x24000000 0x1c000000>;
         compatible = "shared-dma-pool";
-        reusable;
-        alignment = <0x00001000>;
+        no-map;
     };
 };
+```
 
+If you still want the optional CMA driver, bind that same reserved region through a platform node:
+
+```dts
 biturbo_cma {
     compatible = "biturbo,cma-pool";
     memory-region = <&biturbo_fpga_reserved>;
@@ -197,18 +208,18 @@ grep -i -A3 -B1 24000000 /proc/iomem
 ### Example run
 
 ```bash
-BT_FPGA_MEM_BACKEND=cma sudo ./biturbo_fpga model/ggml-model.btpk -p "hi" -n 6
+BT_FPGA_MEM_BACKEND=devmem BT_FPGA_DDR_LAYOUT=persistent sudo ./biturbo_fpga model/ggml-model.btpk -p "hi" -n 6
 ```
 
 Expected persistent-weight log pattern:
 
 ```text
-[FPGA] T-MAC accelerator bound: backend=cma, DMA via /dev/biturbo-cma
-[FPGA] layout (cma, btpk): weights=<weight_bytes>, act=<act_bytes>, res=<res_bytes>
+[FPGA] T-MAC accelerator bound: backend=devmem, CPU DDR3 0x24000000, AVM base 0x24000000, span 0x1C000000
+[FPGA] layout (devmem, persistent, btpk): weights=<weight_bytes>, act=<act_bytes>, res=<res_bytes>
 [FPGA] preloaded btpk weights once: 440647680 bytes across 30 layers
 ```
 
-If you still see a 32 MB DDR span warning or a "streaming layer window" message, the board is still using the old carveout configuration.
+If you still see a 32 MB DDR span warning or `layout (..., streaming, ...)`, the board is still using the old small carveout path.
 
 ### CLI options
 
@@ -266,9 +277,9 @@ Measured with `.btpk`, prompt `hi`, generating 5 tokens:
 | Configuration | Total | Transformer layers | LM head | Sampling |
 |---------------|-------|--------------------|---------|----------|
 | Legacy streaming layer window | 78.33 s | 30.02 s (6.00 s/token) | 47.68 s (9.54 s/token) | 0.63 s (0.1262 s/token) |
-| CMA persistent weights in DDR | 56.38 s | 8.08 s (1.62 s/token) | 47.67 s (9.53 s/token) | 0.63 s (0.1260 s/token) |
+| Persistent weights in DDR | 56.38 s | 8.08 s (1.62 s/token) | 47.67 s (9.53 s/token) | 0.63 s (0.1260 s/token) |
 
-The CMA-backed persistent weight path cuts transformer layer time by about 3.7x. After that improvement, the dominant bottleneck on DE10-Nano becomes the CPU-side LM head, which is still around 9.5 seconds per generated token.
+The persistent weight path cuts transformer layer time by about 3.7x. After that improvement, the dominant bottleneck on DE10-Nano becomes the CPU-side LM head, which is still around 9.5 seconds per generated token.
 
 The built-in profile summary prints:
 
