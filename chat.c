@@ -175,8 +175,8 @@ static turn_stats_t run_turn(bt_model_t *model,
     int prev_token = *prev_token_io;
 
     /* --- Prefill: run bt_forward on every prompt token in order. ---
-     * Last prompt token produces the logits we sample from, so we must
-     * still forward it (unlike bitmamba's prefill + step split). */
+     * Only the last prompt token's logits are sampled, so intermediate
+     * tokens use bt_forward_prefill to skip the final norm + LM head. */
     double t0 = now_sec();
     for (int i = 0; i < n_prompt && !g_interrupted; i++) {
         if (pos >= model->config.max_seq_len) {
@@ -188,7 +188,11 @@ static turn_stats_t run_turn(bt_model_t *model,
             *prev_token_io = prev_token;
             return st;
         }
-        bt_forward(model, prompt_ids[i], pos);
+        if (i == n_prompt - 1) {
+            bt_forward(model, prompt_ids[i], pos);
+        } else {
+            bt_forward_prefill(model, prompt_ids[i], pos);
+        }
         prev_token = prompt_ids[i];
         pos++;
         st.prefill_tokens++;

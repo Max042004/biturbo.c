@@ -1442,7 +1442,8 @@ static void softmax(float* x, int size) {
  * §8. FORWARD PASS (Stages 2-14)
  * ================================================================ */
 
-void bt_forward(bt_model_t* model, int token, int pos) {
+static void bt_forward_impl(bt_model_t* model, int token, int pos,
+                            int skip_lm_head) {
     bt_config_t* cfg = &model->config;
     bt_weights_t* w = &model->weights;
     bt_state_t* s = &model->state;
@@ -1762,7 +1763,15 @@ void bt_forward(bt_model_t* model, int token, int pos) {
     s->profile_last_layers_sec =
         bt_timespec_elapsed_sec(ts_layers_start, ts_layers_end);
 
-    /* Stage 14: Final norm + LM head (tied to token embedding) */
+    /* Stage 14: Final norm + LM head (tied to token embedding).
+     * Prefill tokens other than the last one discard their logits, so the
+     * caller can pass skip_lm_head=1 to skip the final norm + vocab projection
+     * entirely. The sampler only needs the last prompt token's logits. */
+    if (skip_lm_head) {
+        s->profile_last_lm_head_sec = 0.0;
+        return;
+    }
+
     clock_gettime(CLOCK_MONOTONIC, &ts_lm_head_start);
     rms_norm(s->xb, s->x, w->final_norm, dim, cfg->norm_eps);
 
@@ -1786,6 +1795,14 @@ void bt_forward(bt_model_t* model, int token, int pos) {
     clock_gettime(CLOCK_MONOTONIC, &ts_lm_head_end);
     s->profile_last_lm_head_sec =
         bt_timespec_elapsed_sec(ts_lm_head_start, ts_lm_head_end);
+}
+
+void bt_forward(bt_model_t* model, int token, int pos) {
+    bt_forward_impl(model, token, pos, /*skip_lm_head=*/0);
+}
+
+void bt_forward_prefill(bt_model_t* model, int token, int pos) {
+    bt_forward_impl(model, token, pos, /*skip_lm_head=*/1);
 }
 
 /* ================================================================
@@ -2942,7 +2959,13 @@ void bt_generate(bt_model_t* model, bt_sampler_t* sampler,
         if (generating && gen_count == 0)
             clock_gettime(CLOCK_MONOTONIC, &ts_start);
 
-        bt_forward(model, token, pos);
+        /* Only the last prompt token (generating==true on its first hit) and
+         * every generated token need full logits; intermediate prompt tokens
+         * can skip the final norm + LM head projection. */
+        if (generating)
+            bt_forward(model, token, pos);
+        else
+            bt_forward_prefill(model, token, pos);
         if (generating) {
             for (int i = 0; i < BT_PROFILE_LAYER_STAGE_COUNT; i++)
                 layer_stage_totals[i] += s->profile_last_layer_stage_sec[i];

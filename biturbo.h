@@ -318,6 +318,11 @@ const char* bt_decode(const bt_tokenizer_t* tok, int prev_token, int token);
 
 void bt_forward(bt_model_t* model, int token, int pos);
 
+/* Same as bt_forward but skips the final norm + LM-head projection.
+ * Use for prefill tokens whose logits will be discarded; only the last
+ * prompt token needs the full bt_forward so its logits can be sampled. */
+void bt_forward_prefill(bt_model_t* model, int token, int pos);
+
 void bt_sampler_init(bt_sampler_t* s, float temperature, float top_p, uint64_t seed);
 int  bt_sample(bt_sampler_t* s, const float* logits, int vocab_size);
 
