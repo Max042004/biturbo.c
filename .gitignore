@@ -1,7 +1,12 @@
 # --- Compiled Binaries & Objects ---
 biturbo
+biturbo_fpga
+biturbo_fpga_static
+pack_btpk
 main.o
 biturbo.o
+pack_btpk.o
+chat.o
 
 # General patterns for C development
 *.o

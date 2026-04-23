@@ -383,6 +383,164 @@ static float vec_dot_q6k_f32(const bt_block_q6k_t* x, const float* y, int k) {
 #endif
 }
 
+/* ================================================================
+ * Low-rank LM head (SVD) with top-K exact rescore
+ *
+ * Approximates  logits[v] = dot(xb, token_embd[v])  via a pre-computed
+ * truncated SVD  E ≈ E_prod · V_rᵀ , then refines the top-K by the
+ * exact Q6_K dot against token_embd. Non-top-K logits are masked to
+ * -inf so the downstream sampler ignores them.
+ *
+ * Cost: O((vocab + dim)·r) INT8 GEMV + K·Q6_K dots.
+ * ================================================================ */
+
+#define BT_LM_HEAD_TOPK 64   /* Exact-rescore candidates. r=1024 gives */
+                             /* ~99.6% top-1 recall at K=50.            */
+
+static void lm_head_svd(float* logits,
+                        const float* xb,
+                        const float* V_r,           /* [dim, rank]   */
+                        const int8_t* E_q,          /* [vocab, rank] */
+                        const float* E_scale,       /* [vocab]       */
+                        const uint8_t* token_embd,  /* Q6_K          */
+                        int dim, int vocab, int rank, int topK) {
+    /* The NEON path requires rank multiple of 16 (one int8x16_t load per
+     * iteration). The pack_btpk loader validates this at model load. */
+
+    /* 1. h_proj = xb @ V_r  (f32).  Streaming outer i, vectorized over j. */
+    float h_proj[rank];
+    for (int j = 0; j < rank; j++) h_proj[j] = 0.0f;
+#ifdef __ARM_NEON
+    for (int i = 0; i < dim; i++) {
+        const float xi = xb[i];
+        const float* Vrow = V_r + (size_t)i * rank;
+        float32x4_t xi_v = vdupq_n_f32(xi);
+        int j = 0;
+        for (; j <= rank - 16; j += 16) {
+            float32x4_t v0 = vld1q_f32(Vrow + j);
+            float32x4_t v1 = vld1q_f32(Vrow + j + 4);
+            float32x4_t v2 = vld1q_f32(Vrow + j + 8);
+            float32x4_t v3 = vld1q_f32(Vrow + j + 12);
+            float32x4_t h0 = vld1q_f32(h_proj + j);
+            float32x4_t h1 = vld1q_f32(h_proj + j + 4);
+            float32x4_t h2 = vld1q_f32(h_proj + j + 8);
+            float32x4_t h3 = vld1q_f32(h_proj + j + 12);
+            h0 = vmlaq_f32(h0, v0, xi_v);
+            h1 = vmlaq_f32(h1, v1, xi_v);
+            h2 = vmlaq_f32(h2, v2, xi_v);
+            h3 = vmlaq_f32(h3, v3, xi_v);
+            vst1q_f32(h_proj + j,      h0);
+            vst1q_f32(h_proj + j + 4,  h1);
+            vst1q_f32(h_proj + j + 8,  h2);
+            vst1q_f32(h_proj + j + 12, h3);
+        }
+        for (; j < rank; j++) h_proj[j] += Vrow[j] * xi;
+    }
+#else
+    for (int i = 0; i < dim; i++) {
+        const float xi = xb[i];
+        const float* Vrow = V_r + (size_t)i * rank;
+        for (int j = 0; j < rank; j++) h_proj[j] += Vrow[j] * xi;
+    }
+#endif
+
+    /* 2. Quantize h_proj to INT8 (per-vector symmetric) */
+    float h_absmax = 0.0f;
+    for (int j = 0; j < rank; j++) {
+        float a = h_proj[j] < 0.0f ? -h_proj[j] : h_proj[j];
+        if (a > h_absmax) h_absmax = a;
+    }
+    float h_scale = h_absmax / 127.0f;
+    float h_inv = h_scale > 0.0f ? (1.0f / h_scale) : 0.0f;
+    int8_t h_q[rank];
+    for (int j = 0; j < rank; j++) {
+        int q = (int)lrintf(h_proj[j] * h_inv);
+        if (q > 127) q = 127; else if (q < -127) q = -127;
+        h_q[j] = (int8_t)q;
+    }
+
+    /* 3. Approximate logits_approx[v] = E_scale[v] * h_scale * sum(E_q[v] · h_q)
+     * INT8×INT8 → INT16 → pair-add → INT32.  rank%16 is enforced at load. */
+    #pragma omp parallel for schedule(static)
+    for (int v = 0; v < vocab; v++) {
+        const int8_t* row = E_q + (size_t)v * rank;
+        int32_t total;
+#ifdef __ARM_NEON
+        int32x4_t acc0 = vdupq_n_s32(0);
+        int32x4_t acc1 = vdupq_n_s32(0);
+        int j = 0;
+        for (; j <= rank - 16; j += 16) {
+            int8x16_t e = vld1q_s8(row  + j);
+            int8x16_t h = vld1q_s8(h_q  + j);
+            int16x8_t lo = vmull_s8(vget_low_s8(e),  vget_low_s8(h));
+            int16x8_t hi = vmull_s8(vget_high_s8(e), vget_high_s8(h));
+            acc0 = vpadalq_s16(acc0, lo);
+            acc1 = vpadalq_s16(acc1, hi);
+        }
+        int32x4_t sum_v = vaddq_s32(acc0, acc1);
+#  ifdef __aarch64__
+        total = vaddvq_s32(sum_v);
+#  else
+        int32x2_t s2 = vadd_s32(vget_low_s32(sum_v), vget_high_s32(sum_v));
+        s2 = vpadd_s32(s2, s2);
+        total = vget_lane_s32(s2, 0);
+#  endif
+        for (; j < rank; j++) total += (int32_t)row[j] * (int32_t)h_q[j];
+#else
+        total = 0;
+        for (int j = 0; j < rank; j++)
+            total += (int32_t)row[j] * (int32_t)h_q[j];
+#endif
+        logits[v] = E_scale[v] * h_scale * (float)total;
+    }
+
+    /* 4. Top-K partition via min-heap of size K (by approx value).     */
+    int k = topK < vocab ? topK : vocab;
+    int   heap_idx[k];
+    float heap_val[k];
+    for (int i = 0; i < k; i++) {
+        heap_val[i] = logits[i];
+        heap_idx[i] = i;
+    }
+    #define BT_HEAP_SIFT_DOWN(start) do {                                 \
+        int _pi = (start);                                                 \
+        while (1) {                                                        \
+            int _l = 2 * _pi + 1, _r = 2 * _pi + 2, _s = _pi;              \
+            if (_l < k && heap_val[_l] < heap_val[_s]) _s = _l;            \
+            if (_r < k && heap_val[_r] < heap_val[_s]) _s = _r;            \
+            if (_s == _pi) break;                                          \
+            float _tv = heap_val[_pi]; heap_val[_pi] = heap_val[_s]; heap_val[_s] = _tv;  \
+            int   _ti = heap_idx[_pi]; heap_idx[_pi] = heap_idx[_s]; heap_idx[_s] = _ti;  \
+            _pi = _s;                                                      \
+        }                                                                  \
+    } while (0)
+    for (int i = k / 2 - 1; i >= 0; i--) BT_HEAP_SIFT_DOWN(i);
+    for (int v = k; v < vocab; v++) {
+        if (logits[v] > heap_val[0]) {
+            heap_val[0] = logits[v];
+            heap_idx[0] = v;
+            BT_HEAP_SIFT_DOWN(0);
+        }
+    }
+    #undef BT_HEAP_SIFT_DOWN
+
+    /* 5. Mask all logits to -inf, then fill the K survivors with the
+     * exact Q6_K dot product. The -inf mask guarantees greedy argmax
+     * and top-p sampling only consider the exact-scored survivors. */
+    const float neg_inf = -HUGE_VALF;
+    for (int v = 0; v < vocab; v++) logits[v] = neg_inf;
+
+    int nb_per_row = dim / BT_QK_K;
+    size_t row_bytes = (size_t)nb_per_row * sizeof(bt_block_q6k_t);
+    #pragma omp parallel for schedule(static)
+    for (int i = 0; i < k; i++) {
+        int v = heap_idx[i];
+        const bt_block_q6k_t* ev =
+            (const bt_block_q6k_t*)(token_embd + (size_t)v * row_bytes);
+        logits[v] = vec_dot_q6k_f32(ev, xb, dim);
+    }
+}
+
 typedef struct {
     const uint8_t* base;
     size_t pos;
@@ -1608,9 +1766,15 @@ void bt_forward(bt_model_t* model, int token, int pos) {
     clock_gettime(CLOCK_MONOTONIC, &ts_lm_head_start);
     rms_norm(s->xb, s->x, w->final_norm, dim, cfg->norm_eps);
 
-    /* LM head: logits[v] = dot(xb, token_embd[v]) for all vocab
-     * token_embd is Q6_K [vocab_size][dim] */
-    {
+    if (w->lm_head_E_q != NULL && w->lm_head_rank > 0) {
+        /* Fast path: rank-r SVD approx + top-K exact rescore. */
+        lm_head_svd(s->logits, s->xb,
+                    w->lm_head_V, w->lm_head_E_q, w->lm_head_E_scale,
+                    w->token_embedding,
+                    dim, cfg->vocab_size, w->lm_head_rank,
+                    BT_LM_HEAD_TOPK);
+    } else {
+        /* Fallback: full Q6_K dot product over the entire vocab. */
         int nb_per_row = dim / BT_QK_K;
         size_t row_bytes = (size_t)nb_per_row * sizeof(bt_block_q6k_t);
         #pragma omp parallel for schedule(static)
@@ -2152,6 +2316,63 @@ static int bt_load_btpk(bt_model_t* model) {
            model->mmap_data + h->final_norm_off,
            (size_t)cfg->dim * sizeof(float));
 
+    /* LM head SVD factors (optional): rank > 0 means the .btpk carries a
+     * low-rank approximation of the tied LM head. Runtime Stage 14 uses
+     * these for a fast approximate logits pass plus top-K exact rescore. */
+    wt->lm_head_V       = NULL;
+    wt->lm_head_E_q     = NULL;
+    wt->lm_head_E_scale = NULL;
+    wt->lm_head_rank    = 0;
+    if (h->lm_head_rank > 0) {
+        int r = h->lm_head_rank;
+        if ((r & 15) != 0) {
+            fprintf(stderr,
+                    "biturbo: .btpk lm_head_rank=%d must be multiple of 16 "
+                    "(NEON INT8 GEMV loads 16 bytes/iter)\n", r);
+            return -1;
+        }
+        uint64_t want_V  = (uint64_t)cfg->dim * (uint64_t)r * sizeof(float);
+        uint64_t want_Eq = (uint64_t)cfg->vocab_size * (uint64_t)r;
+        uint64_t want_Es = (uint64_t)cfg->vocab_size * sizeof(float);
+
+        if (h->lm_head_V_size != want_V ||
+            h->lm_head_E_q_size != want_Eq ||
+            h->lm_head_E_scale_size != want_Es) {
+            fprintf(stderr,
+                    "biturbo: .btpk lm_head SVD size mismatch "
+                    "(rank=%d V=%llu/%llu E_q=%llu/%llu E_scale=%llu/%llu)\n",
+                    r,
+                    (unsigned long long)h->lm_head_V_size,
+                    (unsigned long long)want_V,
+                    (unsigned long long)h->lm_head_E_q_size,
+                    (unsigned long long)want_Eq,
+                    (unsigned long long)h->lm_head_E_scale_size,
+                    (unsigned long long)want_Es);
+            return -1;
+        }
+        if (btpk_check_range(model, h->lm_head_V_off,
+                             h->lm_head_V_size, "lm_head_V") != 0)
+            return -1;
+        if (btpk_check_range(model, h->lm_head_E_q_off,
+                             h->lm_head_E_q_size, "lm_head_E_q") != 0)
+            return -1;
+        if (btpk_check_range(model, h->lm_head_E_scale_off,
+                             h->lm_head_E_scale_size, "lm_head_E_scale") != 0)
+            return -1;
+
+        wt->lm_head_V =
+            (const float*)(model->mmap_data + h->lm_head_V_off);
+        wt->lm_head_E_q =
+            (const int8_t*)(model->mmap_data + h->lm_head_E_q_off);
+        wt->lm_head_E_scale =
+            (const float*)(model->mmap_data + h->lm_head_E_scale_off);
+        wt->lm_head_rank = r;
+        fprintf(stderr,
+                "biturbo: .btpk lm_head SVD rank=%d (%.2f MB V + %.2f MB E_q)\n",
+                r, (double)want_V / (1024.0 * 1024.0),
+                (double)want_Eq / (1024.0 * 1024.0));
+    }
+
     /* Per-layer norms: copied to heap (they're small F32 arrays and
      * existing code treats them as owned buffers freed in bt_free_model). */
     wt->layers = (bt_layer_weights_t*)bt_calloc(cfg->n_layers,
@@ -2514,6 +2735,13 @@ int bt_load_model(bt_model_t* model, const char* path) {
     const gguf_tensor_info_t* fn = find_tensor(tensors, n_t, "output_norm.weight");
     if (!fn) { fprintf(stderr, "biturbo: missing output_norm.weight\n"); goto fail; }
     wt->final_norm = load_f32_tensor(fn, data_base);
+
+    /* GGUF does not carry LM head SVD factors — leave NULL so Stage 14
+     * falls back to the full Q6_K path. */
+    wt->lm_head_V       = NULL;
+    wt->lm_head_E_q     = NULL;
+    wt->lm_head_E_scale = NULL;
+    wt->lm_head_rank    = 0;
 
     /* Per-layer weights */
     wt->layers = (bt_layer_weights_t*)bt_calloc(cfg->n_layers,

@@ -186,7 +186,15 @@ typedef struct {
     const uint8_t* token_embedding;   /* [vocab_size, dim] Q6_K (mmap'd) */
     bt_layer_weights_t* layers;       /* [n_layers]                     */
     float* final_norm;                /* [dim] output RMS norm          */
-    /* lm_head: tied to token_embedding (transposed)                    */
+    /* lm_head: tied to token_embedding (transposed).
+     * Optional SVD factors for a low-rank approximation of the LM head:
+     *   logits ≈ E_prod · (V_r^T · h),  E_prod stored INT8 per-row.
+     * NULL when not available (GGUF path or old .btpk), in which case
+     * Stage 14 falls back to the full Q6_K dot product over the vocab. */
+    const float*  lm_head_V;          /* [dim, rank]   f32             */
+    const int8_t* lm_head_E_q;        /* [vocab, rank] int8            */
+    const float*  lm_head_E_scale;    /* [vocab]       f32 per-row scale*/
+    int           lm_head_rank;       /* 0 = SVD path disabled         */
 } bt_weights_t;
 
 /* ============================================================

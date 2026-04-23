@@ -224,6 +224,90 @@ static uint64_t emit_f32(const float* data, size_t n_floats,
     return off;
 }
 
+static uint64_t emit_bytes(const void* data, size_t n_bytes,
+                           emit_ctx_t* ctx) {
+    uint64_t off = align_up(*ctx->cursor, BTPK_BLOB_ALIGN);
+    fzero_to(ctx->out, off);
+    fwrite_at(ctx->out, off, data, n_bytes);
+    *ctx->cursor = off + n_bytes;
+    return off;
+}
+
+/* ================================================================
+ * LM head SVD sidecars (optional)
+ *
+ * Read the three raw binary files produced by tools/compute_lmhead_svd.py:
+ *   <dir>/lm_head_V.f32       — [dim,   rank] float32
+ *   <dir>/lm_head_E_q.i8      — [vocab, rank] int8
+ *   <dir>/lm_head_E_scale.f32 — [vocab]       float32
+ *
+ * Rank is derived from the V.f32 file size (dim*rank*4 bytes), and the
+ * other two files are cross-checked against (dim, vocab, rank). meta.json
+ * is ignored — the file sizes are the authoritative description.
+ * ================================================================ */
+
+typedef struct {
+    int      rank;
+    float*   V;          /* [dim,   rank] */
+    int8_t*  E_q;        /* [vocab, rank] */
+    float*   E_scale;    /* [vocab]       */
+    size_t   V_bytes;
+    size_t   E_q_bytes;
+    size_t   E_scale_bytes;
+} lmhead_svd_t;
+
+static void* slurp_file(const char* path, size_t* out_bytes) {
+    FILE* f = fopen(path, "rb");
+    if (!f) die("cannot open sidecar '%s'", path);
+    if (fseek(f, 0, SEEK_END) != 0) die("fseek END failed on '%s'", path);
+    long n = ftell(f);
+    if (n < 0) die("ftell failed on '%s'", path);
+    if (fseek(f, 0, SEEK_SET) != 0) die("fseek SET failed on '%s'", path);
+    void* buf = malloc((size_t)n);
+    if (!buf) die("OOM slurping '%s' (%ld bytes)", path, n);
+    if (fread(buf, 1, (size_t)n, f) != (size_t)n)
+        die("fread short on '%s'", path);
+    fclose(f);
+    *out_bytes = (size_t)n;
+    return buf;
+}
+
+static void load_lmhead_svd(const char* dir, int dim, int vocab,
+                            lmhead_svd_t* out) {
+    char path[1024];
+
+    snprintf(path, sizeof(path), "%s/lm_head_V.f32", dir);
+    out->V = (float*)slurp_file(path, &out->V_bytes);
+    if (out->V_bytes % (sizeof(float) * (size_t)dim) != 0)
+        die("lm_head_V.f32 size %zu is not a multiple of dim*%zu=%zu",
+            out->V_bytes, sizeof(float),
+            sizeof(float) * (size_t)dim);
+    out->rank = (int)(out->V_bytes / (sizeof(float) * (size_t)dim));
+    if (out->rank <= 0 || out->rank > dim)
+        die("derived rank=%d is invalid (dim=%d)", out->rank, dim);
+    fprintf(stderr, "[pack] lm_head SVD: derived rank=%d from V size\n",
+            out->rank);
+
+    snprintf(path, sizeof(path), "%s/lm_head_E_q.i8", dir);
+    out->E_q = (int8_t*)slurp_file(path, &out->E_q_bytes);
+    size_t want_eq = (size_t)vocab * (size_t)out->rank;
+    if (out->E_q_bytes != want_eq)
+        die("lm_head_E_q.i8 size %zu != vocab*rank=%zu",
+            out->E_q_bytes, want_eq);
+
+    snprintf(path, sizeof(path), "%s/lm_head_E_scale.f32", dir);
+    out->E_scale = (float*)slurp_file(path, &out->E_scale_bytes);
+    size_t want_sc = (size_t)vocab * sizeof(float);
+    if (out->E_scale_bytes != want_sc)
+        die("lm_head_E_scale.f32 size %zu != vocab*4=%zu",
+            out->E_scale_bytes, want_sc);
+}
+
+static void free_lmhead_svd(lmhead_svd_t* s) {
+    free(s->V); free(s->E_q); free(s->E_scale);
+    memset(s, 0, sizeof(*s));
+}
+
 /* ================================================================
  * Tokenizer blob: scores + (len, bytes) per token
  * ================================================================ */
@@ -301,12 +385,34 @@ static void emit_token_embed(const uint8_t* token_embedding,
  * ================================================================ */
 
 int main(int argc, char** argv) {
-    if (argc != 3) {
-        fprintf(stderr, "Usage: %s <model.gguf> <out.btpk>\n", argv[0]);
+    const char* gguf_path = NULL;
+    const char* out_path  = NULL;
+    const char* lmhead_svd_dir = NULL;
+
+    /* Parse: <gguf> <out.btpk> [--lmhead-svd-dir <dir>] */
+    int pos_count = 0;
+    for (int i = 1; i < argc; i++) {
+        const char* a = argv[i];
+        if (strcmp(a, "--lmhead-svd-dir") == 0) {
+            if (i + 1 >= argc)
+                die("--lmhead-svd-dir requires a path argument");
+            lmhead_svd_dir = argv[++i];
+        } else if (a[0] == '-') {
+            die("unknown flag: %s", a);
+        } else {
+            if (pos_count == 0) gguf_path = a;
+            else if (pos_count == 1) out_path = a;
+            else die("too many positional arguments");
+            pos_count++;
+        }
+    }
+    if (pos_count != 2) {
+        fprintf(stderr,
+                "Usage: %s <model.gguf> <out.btpk> "
+                "[--lmhead-svd-dir <sidecar_dir>]\n",
+                argv[0]);
         return 1;
     }
-    const char* gguf_path = argv[1];
-    const char* out_path  = argv[2];
 
     bt_model_t model;
     if (bt_load_model(&model, gguf_path) != 0)
@@ -361,6 +467,32 @@ int main(int argc, char** argv) {
     hdr.final_norm_off  = emit_f32(model.weights.final_norm,
                                    (size_t)model.config.dim, &ctx);
     hdr.final_norm_size = (uint64_t)model.config.dim * sizeof(float);
+
+    /* LM head SVD factors (optional). Read sidecars and emit three sections;
+     * leaves hdr.lm_head_rank = 0 untouched when no directory is given. */
+    lmhead_svd_t svd; memset(&svd, 0, sizeof(svd));
+    if (lmhead_svd_dir) {
+        load_lmhead_svd(lmhead_svd_dir,
+                        model.config.dim, model.config.vocab_size, &svd);
+
+        size_t V_bytes    = (size_t)model.config.dim * svd.rank * sizeof(float);
+        size_t E_q_bytes  = (size_t)model.config.vocab_size * svd.rank;
+        size_t E_sc_bytes = (size_t)model.config.vocab_size * sizeof(float);
+
+        hdr.lm_head_rank         = svd.rank;
+        hdr.lm_head_V_off        = emit_bytes(svd.V,       V_bytes,    &ctx);
+        hdr.lm_head_V_size       = V_bytes;
+        hdr.lm_head_E_q_off      = emit_bytes(svd.E_q,     E_q_bytes,  &ctx);
+        hdr.lm_head_E_q_size     = E_q_bytes;
+        hdr.lm_head_E_scale_off  = emit_bytes(svd.E_scale, E_sc_bytes, &ctx);
+        hdr.lm_head_E_scale_size = E_sc_bytes;
+
+        fprintf(stderr,
+                "[pack] lm_head SVD: rank=%d, V=%.2f MB, E_q=%.2f MB, "
+                "E_scale=%.2f MB\n",
+                svd.rank, V_bytes / 1e6, E_q_bytes / 1e6, E_sc_bytes / 1e6);
+        free_lmhead_svd(&svd);
+    }
 
     /* Per-layer */
     for (int l = 0; l < model.config.n_layers; l++) {

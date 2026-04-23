@@ -36,7 +36,7 @@
 #define BTPK_MAGIC6 'L'
 #define BTPK_MAGIC7 '\0'
 
-#define BTPK_VERSION      2
+#define BTPK_VERSION      3
 #define BTPK_FMT_TMAC_TL2 1   /* engine-striped T-MAC TL2 */
 #define BTPK_BLOB_ALIGN   64  /* 4× beat size; generous cache-line alignment */
 
@@ -75,6 +75,20 @@ typedef struct {
     /* Final RMS norm (dim floats) */
     uint64_t final_norm_off;
     uint64_t final_norm_size;  /* == dim * sizeof(float)          */
+
+    /* LM head SVD factors (optional; rank=0 means absent).
+     * Runtime uses these to approximate logits = E · h as a low-rank
+     * product (V_r · h then E_q·h_proj), then refines the top-K with
+     * an exact Q6_K dot against token_embed. When rank=0, the runtime
+     * falls back to the full Q6_K LM head. */
+    int32_t  lm_head_rank;
+    int32_t  _lm_head_pad;
+    uint64_t lm_head_V_off;        /* [dim, rank]   float32 */
+    uint64_t lm_head_V_size;
+    uint64_t lm_head_E_q_off;      /* [vocab, rank] int8    */
+    uint64_t lm_head_E_q_size;
+    uint64_t lm_head_E_scale_off;  /* [vocab]       float32 */
+    uint64_t lm_head_E_scale_size;
 
     /* Per-layer directory array (n_layers entries) */
     uint64_t layers_off;       /* file offset of btpk_layer_dir[] */
