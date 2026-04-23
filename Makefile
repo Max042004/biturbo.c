@@ -13,7 +13,7 @@ endif
 
 TARGET     = biturbo
 PACKER     = pack_btpk
-SRCS       = main.c biturbo.c
+SRCS       = main.c biturbo.c chat.c
 OBJS       = $(SRCS:.c=.o)
 PACK_OBJS  = pack_btpk.o biturbo.o
 
@@ -27,7 +27,7 @@ $(TARGET): $(OBJS)
 $(PACKER): $(PACK_OBJS)
 	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS)
 
-%.o: %.c biturbo.h biturbo_btpk.h
+%.o: %.c biturbo.h biturbo_btpk.h chat.h
 	$(CC) $(CFLAGS) -c -o $@ $<
 
 debug: CFLAGS = -std=gnu99 -O0 -g -Wall -Wextra -Wpedantic -fsanitize=address,undefined
@@ -44,7 +44,7 @@ KDIR        ?= /lib/modules/$(shell uname -r)/build
 CMA_KCFLAGS ?= -march=armv7-a -Wa,-march=armv7-a -mfpu=vfp
 
 fpga:
-	$(FPGA_CC) $(FPGA_CFLAGS) -o biturbo_fpga main.c biturbo.c $(FPGA_LDFLAGS)
+	$(FPGA_CC) $(FPGA_CFLAGS) -o biturbo_fpga main.c biturbo.c chat.c $(FPGA_LDFLAGS)
 
 cma-module:
 	$(MAKE) -C $(KDIR) M=$(CURDIR)/kernel KCFLAGS="$(CMA_KCFLAGS)" modules
