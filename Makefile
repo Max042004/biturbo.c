@@ -36,8 +36,8 @@ debug: clean $(TARGET) $(PACKER)
 
 # FPGA build: cross-compile for DE10-Nano ARM with T-MAC accelerator
 FPGA_CC     ?= arm-linux-gnueabihf-gcc
-FPGA_CFLAGS  = -std=gnu99 -O2 -Wall -Wextra -mcpu=cortex-a9 -mfpu=neon -mfloat-abi=hard -DBT_FPGA -DNDEBUG
-FPGA_LDFLAGS = -lm
+FPGA_CFLAGS  = -std=gnu99 -O3 -Wall -Wextra -mcpu=cortex-a9 -mfpu=neon -mfloat-abi=hard -funsafe-math-optimizations -fopenmp -DBT_FPGA -DNDEBUG
+FPGA_LDFLAGS = -lm -fopenmp
 KDIR        ?= /lib/modules/$(shell uname -r)/build
 # Linux 4.14 arm hard-float toolchains can mis-detect ARMv7 during cc-option
 # probing and fall back to -march=armv5t unless we force the module build flags.

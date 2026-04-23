@@ -246,6 +246,143 @@ static void dequantize_q6k(const bt_block_q6k_t* x, float* y, int k) {
     }
 }
 
+/* Fused Q6_K dequantization and dot product*/
+static float vec_dot_q6k_f32(const bt_block_q6k_t* x, const float* y, int k) {
+    int nb = k >> 8;
+#ifdef __ARM_NEON
+    float32x4_t acc0 = vdupq_n_f32(0.0f);
+    float32x4_t acc1 = vdupq_n_f32(0.0f);
+    float32x4_t acc2 = vdupq_n_f32(0.0f);
+    float32x4_t acc3 = vdupq_n_f32(0.0f);
+
+    uint8x16_t m4b   = vdupq_n_u8(0x0F);
+    uint8x16_t m2b   = vdupq_n_u8(0x03);
+    int8x16_t  sub32 = vdupq_n_s8(32);
+
+    for (int i = 0; i < nb; i++) {
+        float d = bt_f16_to_f32(x[i].d);
+        const uint8_t* ql = x[i].ql;
+        const uint8_t* qh = x[i].qh;
+        const int8_t* sc = x[i].scales;
+
+        for (int n = 0; n < BT_QK_K; n += 128) {
+            for (int l = 0; l < 32; l += 16) {
+                int is = l >> 4;
+                
+                float d_sc0 = d * sc[is+0];
+                float d_sc2 = d * sc[is+2];
+                float d_sc4 = d * sc[is+4];
+                float d_sc6 = d * sc[is+6];
+
+                float32x4_t scale0_vec = vdupq_n_f32(d_sc0);
+                float32x4_t scale2_vec = vdupq_n_f32(d_sc2);
+                float32x4_t scale4_vec = vdupq_n_f32(d_sc4);
+                float32x4_t scale6_vec = vdupq_n_f32(d_sc6);
+
+                // --- LOAD 16 BYTES AT ONCE ---
+                uint8x16_t ql_0 = vld1q_u8(ql + l + 0);
+                uint8x16_t ql_2 = vld1q_u8(ql + l + 32);
+                uint8x16_t qh_base = vld1q_u8(qh + l);
+
+                // --- UNPACK q1 (Offsets 0 to 15) ---
+                uint8x16_t qh_0 = vshlq_n_u8(vandq_u8(qh_base, m2b), 4);
+                int8x16_t q1_vec = vsubq_s8(vreinterpretq_s8_u8(vorrq_u8(vandq_u8(ql_0, m4b), qh_0)), sub32);
+
+                // --- UNPACK q2 (Offsets 32 to 47) ---
+                uint8x16_t qh_2 = vshlq_n_u8(vandq_u8(vshrq_n_u8(qh_base, 2), m2b), 4);
+                int8x16_t q2_vec = vsubq_s8(vreinterpretq_s8_u8(vorrq_u8(vandq_u8(ql_2, m4b), qh_2)), sub32);
+
+                // --- UNPACK q3 (Offsets 64 to 79) ---
+                uint8x16_t qh_4 = vshlq_n_u8(vandq_u8(vshrq_n_u8(qh_base, 4), m2b), 4);
+                int8x16_t q3_vec = vsubq_s8(vreinterpretq_s8_u8(vorrq_u8(vshrq_n_u8(ql_0, 4), qh_4)), sub32);
+
+                // --- UNPACK q4 (Offsets 96 to 111) ---
+                uint8x16_t qh_6 = vshlq_n_u8(vandq_u8(vshrq_n_u8(qh_base, 6), m2b), 4);
+                int8x16_t q4_vec = vsubq_s8(vreinterpretq_s8_u8(vorrq_u8(vshrq_n_u8(ql_2, 4), qh_6)), sub32);
+
+                // --- EXPAND q1 TO FLOATS AND MULTIPLY ---
+                int16x8_t q1_low  = vmovl_s8(vget_low_s8(q1_vec));
+                int16x8_t q1_high = vmovl_s8(vget_high_s8(q1_vec));
+                acc0 = vmlaq_f32(acc0, vld1q_f32(y + l + 0),  vmulq_f32(vcvtq_f32_s32(vmovl_s16(vget_low_s16(q1_low))), scale0_vec));
+                acc1 = vmlaq_f32(acc1, vld1q_f32(y + l + 4),  vmulq_f32(vcvtq_f32_s32(vmovl_s16(vget_high_s16(q1_low))), scale0_vec));
+                acc2 = vmlaq_f32(acc2, vld1q_f32(y + l + 8),  vmulq_f32(vcvtq_f32_s32(vmovl_s16(vget_low_s16(q1_high))), scale0_vec));
+                acc3 = vmlaq_f32(acc3, vld1q_f32(y + l + 12), vmulq_f32(vcvtq_f32_s32(vmovl_s16(vget_high_s16(q1_high))), scale0_vec));
+
+                // --- EXPAND q2 TO FLOATS AND MULTIPLY ---
+                int16x8_t q2_low  = vmovl_s8(vget_low_s8(q2_vec));
+                int16x8_t q2_high = vmovl_s8(vget_high_s8(q2_vec));
+                acc0 = vmlaq_f32(acc0, vld1q_f32(y + l + 32), vmulq_f32(vcvtq_f32_s32(vmovl_s16(vget_low_s16(q2_low))), scale2_vec));
+                acc1 = vmlaq_f32(acc1, vld1q_f32(y + l + 36), vmulq_f32(vcvtq_f32_s32(vmovl_s16(vget_high_s16(q2_low))), scale2_vec));
+                acc2 = vmlaq_f32(acc2, vld1q_f32(y + l + 40), vmulq_f32(vcvtq_f32_s32(vmovl_s16(vget_low_s16(q2_high))), scale2_vec));
+                acc3 = vmlaq_f32(acc3, vld1q_f32(y + l + 44), vmulq_f32(vcvtq_f32_s32(vmovl_s16(vget_high_s16(q2_high))), scale2_vec));
+
+                // --- EXPAND q3 TO FLOATS AND MULTIPLY ---
+                int16x8_t q3_low  = vmovl_s8(vget_low_s8(q3_vec));
+                int16x8_t q3_high = vmovl_s8(vget_high_s8(q3_vec));
+                acc0 = vmlaq_f32(acc0, vld1q_f32(y + l + 64), vmulq_f32(vcvtq_f32_s32(vmovl_s16(vget_low_s16(q3_low))), scale4_vec));
+                acc1 = vmlaq_f32(acc1, vld1q_f32(y + l + 68), vmulq_f32(vcvtq_f32_s32(vmovl_s16(vget_high_s16(q3_low))), scale4_vec));
+                acc2 = vmlaq_f32(acc2, vld1q_f32(y + l + 72), vmulq_f32(vcvtq_f32_s32(vmovl_s16(vget_low_s16(q3_high))), scale4_vec));
+                acc3 = vmlaq_f32(acc3, vld1q_f32(y + l + 76), vmulq_f32(vcvtq_f32_s32(vmovl_s16(vget_high_s16(q3_high))), scale4_vec));
+
+                // --- EXPAND q4 TO FLOATS AND MULTIPLY ---
+                int16x8_t q4_low  = vmovl_s8(vget_low_s8(q4_vec));
+                int16x8_t q4_high = vmovl_s8(vget_high_s8(q4_vec));
+                acc0 = vmlaq_f32(acc0, vld1q_f32(y + l + 96),  vmulq_f32(vcvtq_f32_s32(vmovl_s16(vget_low_s16(q4_low))), scale6_vec));
+                acc1 = vmlaq_f32(acc1, vld1q_f32(y + l + 100), vmulq_f32(vcvtq_f32_s32(vmovl_s16(vget_high_s16(q4_low))), scale6_vec));
+                acc2 = vmlaq_f32(acc2, vld1q_f32(y + l + 104), vmulq_f32(vcvtq_f32_s32(vmovl_s16(vget_low_s16(q4_high))), scale6_vec));
+                acc3 = vmlaq_f32(acc3, vld1q_f32(y + l + 108), vmulq_f32(vcvtq_f32_s32(vmovl_s16(vget_high_s16(q4_high))), scale6_vec));
+            }
+            y  += 128;
+            ql += 64;
+            qh += 32;
+            sc += 8;
+        }
+    }
+    float32x4_t sum_vec = vaddq_f32(vaddq_f32(acc0, acc1), vaddq_f32(acc2, acc3));
+#ifdef __aarch64__
+    float sum = vaddvq_f32(sum_vec);
+#else
+    float32x2_t s2 = vadd_f32(vget_low_f32(sum_vec), vget_high_f32(sum_vec));
+    s2 = vpadd_f32(s2, s2);
+    float sum = vget_lane_f32(s2, 0);
+#endif
+    return sum;
+#else
+    float sum0 = 0.0f, sum1 = 0.0f, sum2 = 0.0f, sum3 = 0.0f;
+    for (int i = 0; i < nb; i++) {
+        float d = bt_f16_to_f32(x[i].d);
+        const uint8_t* ql = x[i].ql;
+        const uint8_t* qh = x[i].qh;
+        const int8_t* sc = x[i].scales;
+        for (int n = 0; n < BT_QK_K; n += 128) {
+            for (int l = 0; l < 32; ++l) {
+                int is = l >> 4;
+                
+                float d_sc0 = d * sc[is+0];
+                float d_sc2 = d * sc[is+2];
+                float d_sc4 = d * sc[is+4];
+                float d_sc6 = d * sc[is+6];
+
+                int8_t q1 = (int8_t)((ql[l+ 0] & 0xF) | (((qh[l]>>0)&3)<<4)) - 32;
+                int8_t q2 = (int8_t)((ql[l+32] & 0xF) | (((qh[l]>>2)&3)<<4)) - 32;
+                int8_t q3 = (int8_t)((ql[l+ 0]  >> 4) | (((qh[l]>>4)&3)<<4)) - 32;
+                int8_t q4 = (int8_t)((ql[l+32]  >> 4) | (((qh[l]>>6)&3)<<4)) - 32;
+                
+                sum0 += y[l+ 0] * (d_sc0 * q1);
+                sum1 += y[l+32] * (d_sc2 * q2);
+                sum2 += y[l+64] * (d_sc4 * q3);
+                sum3 += y[l+96] * (d_sc6 * q4);
+            }
+            y  += 128;
+            ql += 64;
+            qh += 32;
+            sc += 8;
+        }
+    }
+    return sum0 + sum1 + sum2 + sum3;
+#endif
+}
+
 typedef struct {
     const uint8_t* base;
     size_t pos;
@@ -1476,37 +1613,10 @@ void bt_forward(bt_model_t* model, int token, int pos) {
     {
         int nb_per_row = dim / BT_QK_K;
         size_t row_bytes = (size_t)nb_per_row * sizeof(bt_block_q6k_t);
-        float* tmp = s->xb2;  /* reuse scratch buffer (>= dim floats) */
+        #pragma omp parallel for schedule(static)
         for (int v = 0; v < cfg->vocab_size; v++) {
             const bt_block_q6k_t* ev = (const bt_block_q6k_t*)(w->token_embedding + (size_t)v * row_bytes);
-            dequantize_q6k(ev, tmp, dim);
-            float sum = 0.0f;
-#ifdef __ARM_NEON
-            float32x4_t acc = vdupq_n_f32(0.0f);
-            int d = 0;
-            for (; d + 3 < dim; d += 4) {
-                float32x4_t xv = vld1q_f32(s->xb + d);
-                float32x4_t tv = vld1q_f32(tmp + d);
-#ifdef __aarch64__
-                acc = vfmaq_f32(acc, xv, tv);
-#else
-                acc = vmlaq_f32(acc, xv, tv);
-#endif
-            }
-#ifdef __aarch64__
-            sum = vaddvq_f32(acc);
-#else
-            {
-                float32x2_t s2 = vadd_f32(vget_low_f32(acc), vget_high_f32(acc));
-                s2 = vpadd_f32(s2, s2);
-                sum = vget_lane_f32(s2, 0);
-            }
-#endif
-            for (; d < dim; d++) sum += s->xb[d] * tmp[d];
-#else
-            for (int d = 0; d < dim; d++) sum += s->xb[d] * tmp[d];
-#endif
-            s->logits[v] = sum;
+            s->logits[v] = vec_dot_q6k_f32(ev, s->xb, dim);
         }
     }
     clock_gettime(CLOCK_MONOTONIC, &ts_lm_head_end);
